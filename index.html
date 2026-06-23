@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PDF → Excel Converter</title>
+
+<!-- Pyodide runtime. If a newer version exists, bump the number here
+     (check the latest at https://pyodide.org). -->
+<script src="https://cdn.jsdelivr.net/pyodide/v314.0.0/full/pyodide.js"></script>
+
+<style>
+  :root { --ink:#1a1a1a; --muted:#666; --line:#ddd; --accent:#1d4ed8; --warn:#a11; }
+  * { box-sizing: border-box; }
+  body { font-family: "Segoe UI", system-ui, sans-serif; color: var(--ink);
+         max-width: 760px; margin: 0 auto; padding: 28px 20px 60px; line-height: 1.5; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  .notice { color: var(--warn); font-style: italic; font-size: .92rem;
+            border-left: 3px solid var(--warn); padding: 6px 12px; margin: 14px 0; }
+  .card { border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin-top: 18px; }
+  label.opt { display: block; margin: 8px 0; font-size: .92rem; }
+  select { font-size: .92rem; padding: 2px 4px; }
+  #drop { border: 2px dashed var(--line); border-radius: 10px; padding: 26px;
+          text-align: center; color: var(--muted); cursor: pointer; transition: .15s; }
+  #drop.hover { border-color: var(--accent); color: var(--accent); background:#f5f8ff; }
+  button { font: inherit; }
+  #go { background: var(--accent); color:#fff; border:0; border-radius:8px;
+        padding: 12px 18px; font-weight:600; cursor:pointer; margin-top:14px; }
+  #go:disabled { background:#9bb4f0; cursor: default; }
+  #status { font-size:.9rem; color: var(--muted); margin-top:12px; min-height:1.2em; }
+  ul#results { list-style:none; padding:0; margin:14px 0 0; }
+  ul#results li { display:flex; align-items:center; justify-content:space-between;
+                  border:1px solid var(--line); border-radius:8px; padding:8px 12px; margin-bottom:8px; }
+  ul#results a { color: var(--accent); text-decoration:none; font-weight:600; }
+  .ok { color:#137333; } .err { color: var(--warn); }
+  .spin { display:inline-block; width:14px; height:14px; border:2px solid #ccc;
+          border-top-color: var(--accent); border-radius:50%; animation: s .8s linear infinite;
+          vertical-align:-2px; margin-right:6px; }
+  @keyframes s { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<!-- ===================================================================== -->
+<!--  EDITABLE TEXT  — change anything between the tags below freely.      -->
+<!-- ===================================================================== -->
+<h1>PDF → Excel Converter</h1>
+<p>
+  Select one or more invoice PDF files. Each is converted to an Excel file
+  (<code>.xlsx</code>) that you can download. Everything happens inside your
+  own browser — no files are uploaded to any server.
+</p>
+<p class="notice">
+  Please note: this converter has so far only been tested with PDF invoices
+  from <strong>Color Line Cargo</strong>. Invoices from other companies may use
+  a different layout and might not convert correctly.
+</p>
+<!-- ===================================================================== -->
+
+<div class="card">
+  <div id="drop">Click to choose PDF files — or drag &amp; drop them here</div>
+  <input id="file" type="file" accept="application/pdf,.pdf" multiple hidden />
+
+  <label class="opt">
+    <input type="checkbox" id="cfgblock" checked />
+    Include the “With Following Configuration” block in the description
+  </label>
+  <label class="opt">
+    Buyer / recipient mapping:
+    <select id="addrmode">
+      <option value="standard">Standard (top address = buyer, delivery = recipient)</option>
+      <option value="delivery_as_buyer">Delivery address = buyer, recipient blank</option>
+    </select>
+  </label>
+
+  <button id="go" disabled>Loading converter…</button>
+  <div id="status"><span class="spin"></span>Starting Python environment…</div>
+  <ul id="results"></ul>
+</div>
+
+<script>
+let pyodide = null;
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status"), goBtn = $("go"), fileInput = $("file"), drop = $("drop");
+let chosenFiles = [];
+
+function setStatus(html) { statusEl.innerHTML = html; }
+
+// ---- 1. Boot Pyodide, install packages, load the converter module --------
+async function boot() {
+  try {
+    pyodide = await loadPyodide();
+    setStatus('<span class="spin"></span>Installing PDF libraries (first load only)…');
+    await pyodide.loadPackage("micropip");
+    const micropip = pyodide.pyimport("micropip");
+    await micropip.install(["pdfminer.six", "openpyxl"]);
+
+    setStatus('<span class="spin"></span>Loading converter…');
+    const code = await (await fetch("converter_core.py")).text();
+    pyodide.FS.writeFile("converter_core.py", code);
+    pyodide.runPython(`
+import converter_core
+def _convert(in_name, include_config, address_mode):
+    with open(in_name, "rb") as f:
+        data = f.read()
+    cfg = converter_core.Config(
+        include_config_block=include_config,
+        address_mode=address_mode,
+    )
+    out = converter_core.convert_pdf_bytes(data, cfg)
+    out_name = in_name.rsplit(".", 1)[0] + ".xlsx"
+    with open(out_name, "wb") as f:
+        f.write(out)
+    return out_name
+`);
+    goBtn.textContent = "Convert";
+    goBtn.disabled = chosenFiles.length === 0;
+    setStatus("Ready. Choose your PDF files.");
+  } catch (e) {
+    setStatus('<span class="err">Failed to start: ' + e + '</span>');
+  }
+}
+
+// ---- 2. File selection (click + drag/drop) -------------------------------
+drop.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => setFiles([...fileInput.files]));
+["dragover", "dragenter"].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("hover"); }));
+["dragleave", "drop"].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("hover"); }));
+drop.addEventListener("drop", e =>
+  setFiles([...e.dataTransfer.files].filter(f => f.name.toLowerCase().endsWith(".pdf"))));
+
+function setFiles(files) {
+  chosenFiles = files;
+  drop.textContent = files.length
+    ? `${files.length} file(s) selected: ` + files.map(f => f.name).join(", ")
+    : "Click to choose PDF files — or drag & drop them here";
+  goBtn.disabled = !(pyodide && files.length);
+}
+
+// ---- 3. Convert ----------------------------------------------------------
+goBtn.addEventListener("click", async () => {
+  goBtn.disabled = true;
+  $("results").innerHTML = "";
+  const includeConfig = $("cfgblock").checked;
+  const addressMode = $("addrmode").value;
+
+  for (let i = 0; i < chosenFiles.length; i++) {
+    const file = chosenFiles[i];
+    setStatus(`<span class="spin"></span>Converting ${i + 1} of ${chosenFiles.length}: ${file.name}`);
+    try {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      const safe = "in_" + i + ".pdf";
+      pyodide.FS.writeFile(safe, buf);
+      const outName = pyodide.runPython(
+        `_convert(${JSON.stringify(safe)}, ${includeConfig ? "True" : "False"}, ${JSON.stringify(addressMode)})`
+      );
+      const out = pyodide.FS.readFile(outName);            // Uint8Array
+      const blob = new Blob([out],
+        { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      const url = URL.createObjectURL(blob);
+      const niceName = file.name.replace(/\.pdf$/i, "") + ".xlsx";
+      addResult(file.name, url, niceName, true);
+    } catch (e) {
+      addResult(file.name, null, String(e), false);
+    }
+  }
+  setStatus("Done. Click each file to download.");
+  goBtn.disabled = false;
+});
+
+function addResult(pdfName, url, info, ok) {
+  const li = document.createElement("li");
+  const left = document.createElement("span");
+  left.innerHTML = (ok ? '<span class="ok">✓</span> ' : '<span class="err">✗</span> ') + pdfName;
+  li.appendChild(left);
+  if (ok) {
+    const a = document.createElement("a");
+    a.href = url; a.download = info; a.textContent = "Download " + info;
+    li.appendChild(a);
+  } else {
+    const s = document.createElement("span");
+    s.className = "err"; s.textContent = info;
+    li.appendChild(s);
+  }
+  $("results").appendChild(li);
+}
+
+boot();
+</script>
+</body>
+</html>
