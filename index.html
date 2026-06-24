@@ -8,6 +8,8 @@
 <!-- Pyodide runtime. If a newer version exists, bump the number here
      (check the latest at https://pyodide.org). -->
 <script src="https://cdn.jsdelivr.net/pyodide/v314.0.0/full/pyodide.js"></script>
+<!-- JSZip: bundles all converted files into one .zip for "Download all". -->
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 
 <style>
   :root { --ink:#1a1a1a; --muted:#666; --line:#ddd; --accent:#1d4ed8; --warn:#a11; }
@@ -27,6 +29,8 @@
   #go { background: var(--accent); color:#fff; border:0; border-radius:8px;
         padding: 12px 18px; font-weight:600; cursor:pointer; margin-top:14px; }
   #go:disabled { background:#9bb4f0; cursor: default; }
+  #zipAll { background:#137333; color:#fff; border:0; border-radius:8px;
+            padding: 10px 16px; font-weight:600; cursor:pointer; margin-top:4px; }
   #status { font-size:.9rem; color: var(--muted); margin-top:12px; min-height:1.2em; }
   ul#results { list-style:none; padding:0; margin:14px 0 0; }
   ul#results li { display:flex; align-items:center; justify-content:space-between;
@@ -76,6 +80,7 @@
   <button id="go" disabled>Loading converter…</button>
   <div id="status"><span class="spin"></span>Starting Python environment…</div>
   <ul id="results"></ul>
+  <button id="zipAll" hidden>Download all (.zip)</button>
 </div>
 
 <script>
@@ -83,8 +88,13 @@ let pyodide = null;
 const $ = (id) => document.getElementById(id);
 const statusEl = $("status"), goBtn = $("go"), fileInput = $("file"), drop = $("drop");
 let chosenFiles = [];
+let converted = [];   // {name, bytes} for every successful conversion this run
 
 function setStatus(html) { statusEl.innerHTML = html; }
+function esc(s) {                       // escape text before it goes into innerHTML
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+}
 
 // ---- 1. Boot Pyodide, install packages, load the converter module --------
 async function boot() {
@@ -117,7 +127,7 @@ def _convert(in_name, include_config, address_mode):
     goBtn.disabled = chosenFiles.length === 0;
     setStatus("Ready. Choose your PDF files.");
   } catch (e) {
-    setStatus('<span class="err">Failed to start: ' + e + '</span>');
+    setStatus('<span class="err">Failed to start: ' + esc(e) + '</span>');
   }
 }
 
@@ -143,12 +153,14 @@ function setFiles(files) {
 goBtn.addEventListener("click", async () => {
   goBtn.disabled = true;
   $("results").innerHTML = "";
+  $("zipAll").hidden = true;
+  converted = [];
   const includeConfig = $("cfgblock").checked;
   const addressMode = $("addrmode").value;
 
   for (let i = 0; i < chosenFiles.length; i++) {
     const file = chosenFiles[i];
-    setStatus(`<span class="spin"></span>Converting ${i + 1} of ${chosenFiles.length}: ${file.name}`);
+    setStatus(`<span class="spin"></span>Converting ${i + 1} of ${chosenFiles.length}: ${esc(file.name)}`);
     try {
       const buf = new Uint8Array(await file.arrayBuffer());
       const safe = "in_" + i + ".pdf";
@@ -160,20 +172,56 @@ goBtn.addEventListener("click", async () => {
       const blob = new Blob([out],
         { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
       const url = URL.createObjectURL(blob);
-      const niceName = file.name.replace(/\.pdf$/i, "") + ".xlsx";
+      const niceName = uniqueName(file.name.replace(/\.pdf$/i, "") + ".xlsx");
+      converted.push({ name: niceName, bytes: out });
       addResult(file.name, url, niceName, true);
     } catch (e) {
       addResult(file.name, null, String(e), false);
     }
   }
-  setStatus("Done. Click each file to download.");
+  setStatus(`Done. ${converted.length} of ${chosenFiles.length} converted.`);
+  $("zipAll").hidden = converted.length < 2;   // only worth zipping 2+
   goBtn.disabled = false;
+});
+
+// avoid two PDFs named the same producing duplicate entries in the zip
+function uniqueName(name) {
+  if (!converted.some(c => c.name === name)) return name;
+  const dot = name.lastIndexOf(".");
+  const stem = name.slice(0, dot), ext = name.slice(dot);
+  let n = 2;
+  while (converted.some(c => c.name === `${stem}_${n}${ext}`)) n++;
+  return `${stem}_${n}${ext}`;
+}
+
+// ---- 4. Download all as one .zip ----------------------------------------
+$("zipAll").addEventListener("click", async () => {
+  if (!converted.length) return;
+  $("zipAll").disabled = true;
+  setStatus('<span class="spin"></span>Building zip…');
+  try {
+    const zip = new JSZip();
+    for (const f of converted) zip.file(f.name, f.bytes);
+    const blob = await zip.generateAsync({ type: "blob" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "excel_files.zip";
+    a.click();
+    setStatus(`Downloaded excel_files.zip (${converted.length} files).`);
+  } catch (e) {
+    setStatus('<span class="err">Could not build zip: ' + esc(e) + '</span>');
+  }
+  $("zipAll").disabled = false;
 });
 
 function addResult(pdfName, url, info, ok) {
   const li = document.createElement("li");
   const left = document.createElement("span");
-  left.innerHTML = (ok ? '<span class="ok">✓</span> ' : '<span class="err">✗</span> ') + pdfName;
+  const mark = document.createElement("span");
+  mark.className = ok ? "ok" : "err";
+  mark.textContent = ok ? "✓ " : "✗ ";
+  left.appendChild(mark);
+  left.appendChild(document.createTextNode(pdfName));   // filename as text, never HTML
   li.appendChild(left);
   if (ok) {
     const a = document.createElement("a");

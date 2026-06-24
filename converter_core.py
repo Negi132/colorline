@@ -27,23 +27,38 @@ from openpyxl.styles import Font
 
 
 # ============================================================================
-# CONFIG  (same knobs as the desktop version)
+# 1. CONFIGURATION  — same knobs as the desktop pdfToExcel.py.
+#    (Folder/CLI options from the desktop version are omitted here: the browser
+#     has no file system, files come straight from the page.)
 # ============================================================================
 @dataclass
 class Config:
-    pdf_glob: str = "*.pdf"
+    pdf_glob: str = "*.pdf"            # which files to pick up (used by the page)
+
+    # --- parsing behaviour -------------------------------------------------
+    # Include the "With Following Configuration:" block in the description?
     include_config_block: bool = True
-    address_mode: str = "standard"            # or "delivery_as_buyer"
+
+    # How to fill the Kjøper / Mottaker (buyer / recipient) columns:
+    #   "standard"          -> top-left block = buyer, delivery block = recipient
+    #                          (reproduces sample file 90920196 exactly)
+    #   "delivery_as_buyer" -> delivery block = buyer, recipient left blank
+    #                          (reproduces sample file 90920200)
+    address_mode: str = "standard"
+
+    # --- fixed / default values that aren't reliably in the PDF ------------
     transport_mode_default: str = "Postal"
     seller_country_default: str = "Denmark"
-    col_split_x: float = 300.0
-    addr_y_max: float = 185.0
-    thousands_sep: str = "\u00a0"
+
+    # --- geometry / formatting --------------------------------------------
+    col_split_x: float = 300.0        # x that divides the two address columns
+    addr_y_max: float = 185.0         # only read addresses above this y
+    thousands_sep: str = "\u00a0"     # non-breaking space, as in the samples
     decimal_sep: str = ","
 
 
 # ============================================================================
-# COLUMN / EXCLUSION DEFINITIONS
+# 2. COLUMN DEFINITIONS  — reorder/rename here and the writer follows.
 # ============================================================================
 HOVED_COLS = [
     "Faktura", "Fakturadato", "Totalbeløp", "Leveringsbetingelse", "Leveringssted",
@@ -59,6 +74,8 @@ VARE_COLS = [
     "Antall", "Salgsenhet", "Salgspris per enhet", "Linjebeløp", "Valuta",
     "Rabatt %", "Gebyr %", "Bruttovekt (kg)", "Nettovekt (kg)",
 ]
+
+# lines that must never be folded into a line-item description
 EXCLUDE_PREFIXES = (
     "Price", "H.S. Code", "Country of origin", "Serial Number", "Order",
     "Delivery note", "Net Value for Item", "SD IC Discount", "Approval status",
@@ -68,7 +85,9 @@ EXCLUDE_PREFIXES = (
     "Saedding", "DK-6710", "IBAN", "Item Material", "Terms of delivery",
     "Your reference", "Multiple", "Terms of payment", "Current month",
     "PROFORMA", "INTERCOMPANY", "DAP",
-    "Tel :", "Fax :", "Web :", "E-mail :",   # footer right column (pdfminer keeps it separate)
+    # The four below are pdfminer-only: it keeps the footer's right-hand column
+    # as separate lines, so these would otherwise leak into a description.
+    "Tel :", "Fax :", "Web :", "E-mail :",
 )
 ITEM_RE = re.compile(
     r"^(\d+)\s+(\S+)\s+(.+?)\s+([\d.,]+)\s+([A-Z]{2,4})(?:\s+([\d.,]+))?$"
@@ -183,6 +202,21 @@ def titlecase_place(s: str) -> str:
         w.capitalize() if not re.match(r"^[A-Z]{1,2}-?\d", w) else w
         for w in s.split()
     )
+
+
+# Characters that spreadsheet apps may treat as the start of a formula.
+# A cell beginning with one of these (taken straight from a PDF) could run a
+# formula when the resulting .xlsx is opened. Prefixing it with an apostrophe
+# forces the cell to be plain text. Real invoice fields never start with these,
+# so normal output is unchanged — this only ever touches hostile/odd content.
+_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+
+def sanitize_cell(v):
+    """Neutralise spreadsheet-formula injection in text cells."""
+    if isinstance(v, str) and v[:1] in _FORMULA_LEAD:
+        return "'" + v
+    return v
 
 
 def parse_address(lines, drop_labels):
@@ -366,25 +400,25 @@ def build_workbook_bytes(header, items, cfg: Config) -> bytes:
 
     hov.append(HOVED_COLS)
     s = header["seller"]; b = header["buyer"]; r = header["recipient"]
-    hov.append([
+    hov.append([sanitize_cell(v) for v in [
         int(header["invoice_no"]) if header["invoice_no"] else "",
         header["date"], fmt_amount(header["total"], header["currency"], cfg),
         header["terms"], header["delivery_place"], cfg.transport_mode_default, "",
         header["gross_weight"], "", header["n_items"],
         s[0], s[1], s[2], s[3], s[4], b[0], b[1], b[2], b[3], b[4],
         "", "", "", "", "", r[0], r[1], r[2], r[3], r[4],
-    ])
+    ]])
     if header["date"]:
         hov.cell(row=2, column=2).number_format = "yyyy-mm-dd"
 
     var = wb.create_sheet("Varelinjer")
     var.append(VARE_COLS)
     for it in items:
-        var.append([
+        var.append([sanitize_cell(v) for v in [
             it["line"], it["description"], it["tariff"], it["material"],
             it["origin"], it["qty"], it["unit"], it["unit_price"],
             it["line_amount"], it["currency"], it["discount"], "", "", "",
-        ])
+        ]])
 
     for ws, cols in ((hov, HOVED_COLS), (var, VARE_COLS)):
         for c in range(1, len(cols) + 1):
