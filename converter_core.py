@@ -90,7 +90,7 @@ EXCLUDE_PREFIXES = (
     "Tel :", "Fax :", "Web :", "E-mail :",
 )
 ITEM_RE = re.compile(
-    r"^(\d+)\s+(\S+)\s+(.+?)\s+([\d.,]+)\s+([A-Z]{2,4})(?:\s+([\d.,]+))?$"
+    r"^(\d+)\s+(\S+)\s+(.+?)\s+([\d.,]+)\s+([A-Z]{1,4})(?:\s+([\d.,]+))?$"
 )
 CONFIG_HEADER = "With Following Configuration:"
 
