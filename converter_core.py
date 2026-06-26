@@ -58,6 +58,50 @@ class Config:
 
 
 # ============================================================================
+# 1b. COMPANY DETECTION  — decide which layout a PDF uses.
+# ============================================================================
+class UnknownCompanyError(Exception):
+    """The PDF does not match any company layout we recognise."""
+
+
+class UnsupportedCompanyError(Exception):
+    """Recognised company, but the PDF can't be converted reliably (e.g. a
+    corrupted text layer). Carries a human-readable reason."""
+    def __init__(self, company, reason):
+        self.company = company
+        self.reason = reason
+        super().__init__(reason)
+
+
+# company key -> signature substrings (case-insensitive). A PDF matches if ANY
+# signature appears. Chosen as header/footer markers that survive a poor text
+# layer. To add a company, add a signature list here and a parser below.
+COMPANY_SIGNATURES = {
+    "viking": ["viking-life.com", "VIKING LIFE-SAVING EQUIPMENT",
+               "INTERCOMPANY BILLING / TAX INVOICE"],
+    "hay":    ["www.hay.com", "HAY ApS", "DKREX171905651"],
+    "solar":  ["solar.dk", "Solar Danmark", "Proformafaktura", "so[ar"],
+}
+
+# Recognised companies we cannot convert yet, with the reason shown to the user.
+UNSUPPORTED = {
+    "solar": ("Solar invoices use a damaged PDF text layer (characters and "
+              "digits are mis-encoded), so automatic conversion would produce "
+              "unreliable customs data. These need OCR or manual entry."),
+}
+
+
+def detect_company(text: str) -> Optional[str]:
+    """Return 'viking' | 'hay' | 'solar' | None for the given PDF text."""
+    low = text.lower()
+    for company, sigs in COMPANY_SIGNATURES.items():
+        if any(s.lower() in low for s in sigs):
+            return company
+    return None
+
+
+
+# ============================================================================
 # 2. COLUMN DEFINITIONS  — reorder/rename here and the writer follows.
 # ============================================================================
 HOVED_COLS = [
@@ -139,10 +183,12 @@ class Page:
         """Full-width reading order (≈ pdfplumber extract_text)."""
         return self._group(self.frags)
 
-    def band_lines(self, x_lo, x_hi, y_max=None) -> list[str]:
+    def band_lines(self, x_lo, x_hi, y_max=None, y_min=None) -> list[str]:
         """Lines whose fragments start within [x_lo, x_hi) (one column)."""
         sub = [f for f in self.frags
-               if x_lo <= f[1] < x_hi and (y_max is None or f[0] < y_max)]
+               if x_lo <= f[1] < x_hi
+               and (y_max is None or f[0] < y_max)
+               and (y_min is None or f[0] >= y_min)]
         return self._group(sub)
 
 
@@ -247,7 +293,7 @@ def parse_address(lines, drop_labels):
 # ============================================================================
 # CORE PARSE
 # ============================================================================
-def parse_invoice(doc: PdfDoc, cfg: Config):
+def parse_viking(doc: PdfDoc, cfg: Config):
     flat = [re.sub(r"\s+", " ", l).strip() for l in doc.flat_lines]
     all_text = "\n".join(flat)
     left_lines, right_lines = doc.first_page_columns()
@@ -400,8 +446,10 @@ def build_workbook_bytes(header, items, cfg: Config) -> bytes:
 
     hov.append(HOVED_COLS)
     s = header["seller"]; b = header["buyer"]; r = header["recipient"]
+    inv = header["invoice_no"]
+    faktura = int(inv) if isinstance(inv, str) and inv.isdigit() else (inv or "")
     hov.append([sanitize_cell(v) for v in [
-        int(header["invoice_no"]) if header["invoice_no"] else "",
+        faktura,
         header["date"], fmt_amount(header["total"], header["currency"], cfg),
         header["terms"], header["delivery_place"], cfg.transport_mode_default, "",
         header["gross_weight"], "", header["n_items"],
@@ -417,7 +465,8 @@ def build_workbook_bytes(header, items, cfg: Config) -> bytes:
         var.append([sanitize_cell(v) for v in [
             it["line"], it["description"], it["tariff"], it["material"],
             it["origin"], it["qty"], it["unit"], it["unit_price"],
-            it["line_amount"], it["currency"], it["discount"], "", "", "",
+            it["line_amount"], it["currency"], it["discount"], "", "",
+            it.get("net_weight", ""),
         ]])
 
     for ws, cols in ((hov, HOVED_COLS), (var, VARE_COLS)):
@@ -434,8 +483,282 @@ def build_workbook_bytes(header, items, cfg: Config) -> bytes:
 
 
 def convert_pdf_bytes(pdf_bytes: bytes, cfg: Config = None) -> bytes:
-    """Main entry point: PDF bytes in, .xlsx bytes out."""
+    """Main entry point: PDF bytes in, .xlsx bytes out.
+
+    Detects the company first. Unknown layouts raise UnknownCompanyError;
+    recognised-but-unconvertible layouts (e.g. Solar) raise
+    UnsupportedCompanyError. The website turns both into a skip message.
+    """
     cfg = cfg or Config()
     doc = PdfDoc(io.BytesIO(pdf_bytes), cfg)
-    header, items = parse_invoice(doc, cfg)
+    text = "\n".join(doc.flat_lines)
+
+    company = detect_company(text)
+    if company is None:
+        raise UnknownCompanyError("PDF does not match a known invoice layout.")
+    if company in UNSUPPORTED:
+        raise UnsupportedCompanyError(company, UNSUPPORTED[company])
+
+    if company == "viking":
+        header, items = parse_viking(doc, cfg)
+    elif company == "hay":
+        header, items = parse_hay(doc, cfg)
+    else:                                            # safety net
+        raise UnknownCompanyError(f"No parser wired for '{company}'.")
+
     return build_workbook_bytes(header, items, cfg)
+
+
+def detect_company_from_bytes(pdf_bytes: bytes) -> Optional[str]:
+    """Detect the company without converting (used by the page to pre-screen)."""
+    doc = PdfDoc(io.BytesIO(pdf_bytes), Config())
+    return detect_company("\n".join(doc.flat_lines))
+
+
+# ============================================================================
+# HAY PARSER  (customs invoice — clean text layer)
+# ============================================================================
+# main line:  <line#> <item-nr> <qty> EACH <netwt?> <amount/uom> <total>
+HAY_ITEM_RE = re.compile(
+    r"^(\d+)\s+([A-Z0-9][\w\-]*)\s+(\d+)\s+([A-Z]+)\s+([\d.\s]+)$"
+)
+
+
+def _hay_addr(lines):
+    name = street = postal = place = country = ""
+    cleaned = [l.strip() for l in lines if l.strip()
+               and not l.strip().startswith(("Delivery Address", "Invoice Address",
+                                             "CUS"))]
+    for l in cleaned:
+        if l.upper() in ("NORWAY", "DENMARK", "SWEDEN", "GERMANY"):
+            country = l.capitalize(); continue
+        m = re.match(r"^(\d{3,4})\s+(.+)$", l)               # '0277 Oslo'
+        if m and not place:
+            postal, place = m.group(1), m.group(2); continue
+        if not name:
+            name = l; continue
+        if not street:
+            street = l
+    return name, street, postal, place, country
+
+
+def parse_hay(doc: PdfDoc, cfg: Config):
+    flat = [re.sub(r"\s+", " ", l).strip() for l in doc.flat_lines]
+    all_text = "\n".join(flat)
+
+    def find(pat, default=""):
+        m = re.search(pat, all_text)
+        return m.group(1) if m else default
+
+    invoice_no = find(r"Doc nr\s+(\S+)")
+    mdate = re.search(r"(?:^|\n)Date\s+(\d{2})\.(\d{2})\.(\d{4})", all_text)
+    inv_date = (dt.date(int(mdate.group(3)), int(mdate.group(2)), int(mdate.group(1)))
+                if mdate else None)
+    currency = find(r"Currency\s+([A-Z]{3})", "NOK")
+    terms = find(r"Delivery terms\s+(\S+)")
+    gross = find(r"Total Gross Weight\s+([\d.]+)\s*kg")
+    gross_weight = round(float(gross), 3) if gross else None
+    mtot = re.search(r"Total:\s*([\d.]+)", all_text)
+    total_value = float(mtot.group(1)) if mtot else None
+
+    # addresses from page-1 columns (delivery left, invoice middle)
+    p0 = doc.pages[0]
+    delivery = _hay_addr(p0.band_lines(0, 200, y_max=205, y_min=115))
+    invoice = _hay_addr(p0.band_lines(200, 380, y_max=205, y_min=115))
+    seller = _hay_seller(flat)
+
+    # customs summary rows -> {amount: (tariff, country)} for per-line enrichment
+    tariff_by_amount = {}
+    for l in flat:
+        m = re.match(r"^(\d{8,10})\s+([A-Z]{2})\b.*?([\d.]+)$", l)
+        if m:
+            tariff_by_amount.setdefault(m.group(3), (m.group(1), m.group(2)))
+
+    items = parse_hay_items(flat, currency, tariff_by_amount)
+    header = {
+        "invoice_no": invoice_no, "date": inv_date, "currency": currency,
+        "total": total_value, "terms": terms, "delivery_place": place_of(delivery),
+        "gross_weight": gross_weight, "buyer": invoice, "recipient": delivery,
+        "seller": seller, "n_items": len(items),
+    }
+    return header, items
+
+
+def place_of(addr):
+    return addr[3] if addr and len(addr) > 3 else ""
+
+
+def _hay_seller(flat):
+    for i, l in enumerate(flat):
+        if l.startswith("HAY ApS"):
+            street = flat[i + 1].split("Bank")[0].strip() if i + 1 < len(flat) else ""
+            cityline = flat[i + 2] if i + 2 < len(flat) else ""
+            m = re.match(r"^(\d{4})\s+([A-Za-z]+)\s+([A-Z]+)", cityline)
+            if m:
+                return ("HAY ApS", street, m.group(1),
+                        m.group(2).capitalize(), m.group(3).capitalize())
+            return ("HAY ApS", street, "", "", "Denmark")
+    return ("HAY ApS", "Havnen 3", "8700", "Horsens", "Denmark")
+
+
+def parse_hay_items(flat, currency, tariff_by_amount):
+    items = []
+    for i, l in enumerate(flat):
+        if l.startswith("COMP-") or l.startswith("Consisting"):
+            continue
+        m = HAY_ITEM_RE.match(l)
+        if not m:
+            continue
+        nums = [n for n in m.group(5).split() if re.match(r"^[\d.]+$", n)]
+        if len(nums) < 2:                       # need at least amount/uom + total
+            continue
+        item_nr = m.group(2)
+        qty = euro_dot(m.group(3))
+        unit = m.group(4)
+        total = euro_dot(nums[-1])
+        unit_price = euro_dot(nums[-2])
+        net_weight = euro_dot(nums[-3]) if len(nums) >= 3 else None
+        # description is the next non-empty line
+        desc = ""
+        for j in range(i + 1, min(i + 3, len(flat))):
+            t = flat[j].strip()
+            if t and not HAY_ITEM_RE.match(t) and not t.startswith(
+                    ("COMP-", "Consisting", "Line", "Description")):
+                desc = t
+                break
+        tariff, origin = tariff_by_amount.get(nums[-1], ("", ""))
+        items.append({
+            "line": len(items) + 1, "description": desc, "tariff": tariff,
+            "material": item_nr, "origin": origin,
+            "qty": round(qty, 3) if qty is not None else None, "unit": unit,
+            "unit_price": round(unit_price, 2) if unit_price is not None else None,
+            "line_amount": round(total, 2) if total is not None else None,
+            "currency": currency, "discount": None,
+            "net_weight": round(net_weight, 3) if net_weight is not None else None,
+        })
+    return items
+
+
+def euro_dot(s):
+    """Parse a plain dot-decimal number ('1849.54', '9.60')."""
+    try:
+        return float(str(s).replace(",", ""))
+    except (ValueError, TypeError):
+        return None
+
+
+# ============================================================================
+# SOLAR PARSER  (works on OCR text — the browser supplies it via tesseract.js,
+# because Solar's embedded text layer is corrupted and unusable.)
+# ============================================================================
+# OCR line:  <hs8> <description> <land2> <qty> <unit> <weight> G <amount>
+# land's 2nd char may be a mis-read lowercase (e.g. 'SI' -> 'Sl'); unit is 1-4.
+SOLAR_LINE = re.compile(
+    r"^(\d{8})\s+(.+?)\s+([A-Z][A-Za-z])\s+([\d.]+)\s+([A-Za-z]{1,4})\s+"
+    r"([\d.,]+)\s+G\s+([\d.,]+)$"
+)
+SOLAR_MAT = re.compile(r"^\d[\d ]{4,}\d$")          # material-number line
+
+
+def _solar_num(s):
+    """European number from OCR text: '2.893,64' -> 2893.64."""
+    try:
+        return float(s.replace(" ", "").replace(".", "").replace(",", "."))
+    except ValueError:
+        return None
+
+
+_SOLAR_NOISE = ("cvr", "kunde", "solar", "telefonnr", "faxnr", "e-mail", "fakturanr",
+                "kundenr", "betalingsbet", "forfaldsdato", "leveringsbet", "kontotekst",
+                "salgskontor", "dato", "reference", "kontaktperson", "ordre", "vores")
+
+
+def _solar_block(flat, keyword):
+    """Best-effort address block: the lines *below* a keyword (Solar's layout is
+    two-column, so text on the same line as the keyword belongs to another column
+    and is ignored)."""
+    name = street = postal = place = country = ""
+    for i, l in enumerate(flat):
+        if l.startswith(keyword):
+            for c in (flat[j].strip() for j in range(i + 1, min(i + 7, len(flat)))):
+                low = c.lower()
+                if not c or any(low.startswith(n) for n in _SOLAR_NOISE):
+                    continue
+                m = re.match(r"^(GL\s*)?(\d{3,4})\s+(.+)$", c)        # postal + place
+                if m and not place:
+                    postal = ((m.group(1) or "").strip() + m.group(2))
+                    place = m.group(3)
+                    country = "Greenland" if m.group(1) else "Denmark"
+                    continue
+                if not name:
+                    name = c
+                elif not street:
+                    street = c
+            break
+    return name, street, postal, place, country
+
+
+def parse_solar(ocr_text, cfg: Config):
+    flat = [re.sub(r"[ \t]+", " ", l).strip() for l in ocr_text.splitlines()]
+
+    items = []
+    for i, l in enumerate(flat):
+        m = SOLAR_LINE.match(l)
+        if not m:
+            continue
+        hs, desc, land, qty, unit, weight, amount = m.groups()
+        material = ""
+        for j in range(i + 1, min(i + 3, len(flat))):
+            if SOLAR_MAT.match(flat[j]):
+                material = flat[j].replace(" ", "")
+                break
+        qf, amt = _solar_num(qty), _solar_num(amount)
+        items.append({
+            "line": len(items) + 1, "description": desc.strip(), "tariff": hs,
+            "material": material,
+            "origin": land.upper() if land.isalpha() else land,
+            "qty": round(qf, 3) if qf else None, "unit": unit.upper(),
+            "unit_price": round(amt / qf, 2) if (qf and amt is not None) else None,
+            "line_amount": round(amt, 2) if amt is not None else None,
+            "currency": "DKK", "discount": None,
+            "net_weight": round(_solar_num(weight), 3) if _solar_num(weight) else None,
+        })
+
+    inv_nos = list(dict.fromkeys(re.findall(r"Fakturanr\.?\s+(\d{6,})", ocr_text)))
+    md = re.search(r"Dato:?\s*(\d{2})\.(\d{2})\.(\d{4})", ocr_text)
+    inv_date = (dt.date(int(md.group(3)), int(md.group(2)), int(md.group(1)))
+                if md else None)
+    mterms = re.search(r"Leveringsbet\.?\s+([A-Za-z0-9 ./+-]+)", ocr_text)
+    terms = mterms.group(1).strip() if mterms else ""
+
+    # totals cross-check: sum the *distinct* printed invoice totals
+    tot_vals = [_solar_num(m.group(1)) for m in re.finditer(
+        r"(?:Fakturabel[oa]b\s+DKK|Fakturatotal\s*/\s*Valuta|"
+        r"Total ordrebel[oa]b|Total f[oa]r moms)\s+([\d.]+,\d{2})", ocr_text)]
+    distinct = sorted({round(v, 2) for v in tot_vals if v is not None})
+    target = round(sum(distinct), 2) if distinct else None
+    parsed = round(sum(it["line_amount"] for it in items if it["line_amount"]), 2)
+    review = {"ok": target is not None and abs(parsed - target) < 0.5,
+              "target": target, "parsed": parsed, "n_items": len(items),
+              "invoices": inv_nos}
+
+    header = {
+        "invoice_no": "; ".join(inv_nos), "date": inv_date, "currency": "DKK",
+        "total": target, "terms": terms,
+        "delivery_place": _solar_block(flat, "Leveringsadresse")[3],
+        "gross_weight": None,
+        "buyer": _solar_block(flat, "Kunde"),
+        "recipient": _solar_block(flat, "Leveringsadresse"),
+        "seller": ("Solar Danmark A/S", "Industrivej Vest 43", "DK-6600",
+                   "Vejen", "Denmark"),
+        "n_items": len(items),
+    }
+    return header, items, review
+
+
+def convert_solar_ocr(ocr_text, cfg: Config = None):
+    """Solar entry point: OCR text in -> (xlsx bytes, review dict)."""
+    cfg = cfg or Config()
+    header, items, review = parse_solar(ocr_text, cfg)
+    return build_workbook_bytes(header, items, cfg), review
+

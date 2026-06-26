@@ -37,6 +37,14 @@
                   border:1px solid var(--line); border-radius:8px; padding:8px 12px; margin-bottom:8px; }
   ul#results a { color: var(--accent); text-decoration:none; font-weight:600; }
   .ok { color:#137333; } .err { color: var(--warn); }
+  .warn { color:#b45309; }
+  ul#results li.skip { background:#fff8f0; border-color:#f0d9b8; align-items:flex-start; }
+  ul#results li.review { background:#fffbe8; border-color:#f3e08a; align-items:flex-start; }
+  .detail { flex-basis:100%; font-size:.76rem; color:#888; margin-top:2px; }
+  .left { display:flex; flex-wrap:wrap; align-items:baseline; gap:2px; max-width:78%; }
+  .badge { display:inline-block; font-size:.7rem; font-weight:700; letter-spacing:.03em;
+           background:#eef2ff; color:#3730a3; border-radius:5px; padding:1px 6px; margin:0 4px; }
+  .why { flex-basis:100%; font-size:.82rem; color:#7c5a14; margin-top:3px; }
   .spin { display:inline-block; width:14px; height:14px; border:2px solid #ccc;
           border-top-color: var(--accent); border-radius:50%; animation: s .8s linear infinite;
           vertical-align:-2px; margin-right:6px; }
@@ -55,12 +63,13 @@
   own browser — no files are uploaded to any server.
 </p>
 <p class="notice">
-  Please note: this converter has so far only been tested with PDF invoices
-  from <strong>Viking Life-Saving Equipment</strong>. Invoices from other companies may use
-  a different layout and might not convert correctly.
-</p>
-<p>
-  Last updated on 25/06/26 - 11:58.
+  This tool recognises invoices from <strong>VIKING Life-Saving Equipment</strong>,
+  <strong>HAY</strong>, and <strong>Solar</strong>. VIKING and HAY convert directly.
+  Solar invoices are read with <strong>OCR</strong> in your browser (the first Solar
+  file downloads the OCR engine, and OCR takes a few seconds per page); their line
+  totals are checked against the printed invoice total, and any file that doesn't
+  reconcile is flagged for review. Anything unrecognised is skipped with a note,
+  and the rest of your files still process.
 </p>
 <!-- ===================================================================== -->
 
@@ -112,19 +121,81 @@ async function boot() {
     const code = await (await fetch("converter_core.py")).text();
     pyodide.FS.writeFile("converter_core.py", code);
     pyodide.runPython(`
-import converter_core
+import json, converter_core
+
+COMPANY_LABEL = {"viking": "VIKING", "hay": "HAY", "solar": "Solar"}
+
+def _detect(in_name):
+    with open(in_name, "rb") as f:
+        data = f.read()
+    try:
+        return converter_core.detect_company_from_bytes(data) or ""
+    except Exception:
+        return ""
+
+def _convert_solar(ocr_path, include_config, address_mode):
+    # Solar's own text layer is corrupted, so the page OCRs it (tesseract.js)
+    # and passes the recognised text here.
+    try:
+        with open(ocr_path, encoding="utf-8") as f:
+            text = f.read()
+        cfg = converter_core.Config(include_config_block=include_config,
+                                    address_mode=address_mode)
+        xb, review = converter_core.convert_solar_ocr(text, cfg)
+        out = "solar_out.xlsx"
+        with open(out, "wb") as f:
+            f.write(xb)
+        detail = "%d line items; line total %.2f vs invoice total %s" % (
+            review["n_items"], review["parsed"], review["target"])
+        if review["ok"]:
+            return json.dumps({"status": "ok", "company": "Solar", "out": out,
+                               "note": "Read by OCR (line totals verified). "
+                                       "Please still spot-check codes and text.",
+                               "detail": detail})
+        return json.dumps({"status": "review", "company": "Solar", "out": out,
+                           "reason": "OCR line totals do NOT match the printed "
+                                     "invoice total — some lines may be mis-read "
+                                     "or missing. Check before using.",
+                           "detail": detail})
+    except Exception as e:
+        return json.dumps({"status": "error", "company": "Solar",
+                           "reason": "%s: %s" % (type(e).__name__, e)})
+
 def _convert(in_name, include_config, address_mode):
     with open(in_name, "rb") as f:
         data = f.read()
-    cfg = converter_core.Config(
-        include_config_block=include_config,
-        address_mode=address_mode,
-    )
-    out = converter_core.convert_pdf_bytes(data, cfg)
-    out_name = in_name.rsplit(".", 1)[0] + ".xlsx"
-    with open(out_name, "wb") as f:
-        f.write(out)
-    return out_name
+    # 1) detect the company first
+    try:
+        company = converter_core.detect_company_from_bytes(data)
+    except Exception as e:
+        return json.dumps({"status": "error",
+                           "reason": "Could not read this PDF: %s" % e})
+    label = COMPANY_LABEL.get(company, None)
+    # 2) unrecognised -> skip
+    if company is None:
+        return json.dumps({"status": "skipped", "company": None,
+                           "reason": "Unrecognised invoice format — not from a "
+                                     "company this tool knows how to read."})
+    # 3) recognised but unconvertible (e.g. Solar) -> skip with reason
+    if company in converter_core.UNSUPPORTED:
+        return json.dumps({"status": "skipped", "company": label,
+                           "reason": converter_core.UNSUPPORTED[company]})
+    # 4) convert
+    try:
+        cfg = converter_core.Config(include_config_block=include_config,
+                                    address_mode=address_mode)
+        out = converter_core.convert_pdf_bytes(data, cfg)
+        out_name = in_name.rsplit(".", 1)[0] + ".xlsx"
+        with open(out_name, "wb") as f:
+            f.write(out)
+        return json.dumps({"status": "ok", "company": label, "out": out_name})
+    except converter_core.UnsupportedCompanyError as e:
+        return json.dumps({"status": "skipped", "company": label, "reason": e.reason})
+    except converter_core.UnknownCompanyError as e:
+        return json.dumps({"status": "skipped", "company": None, "reason": str(e)})
+    except Exception as e:
+        return json.dumps({"status": "error", "company": label,
+                           "reason": "%s: %s" % (type(e).__name__, e)})
 `);
     goBtn.textContent = "Convert";
     goBtn.disabled = chosenFiles.length === 0;
@@ -152,6 +223,55 @@ function setFiles(files) {
   goBtn.disabled = !(pyodide && files.length);
 }
 
+// ---- OCR for Solar (pdf.js renders pages, tesseract.js reads them) ---------
+// These libraries are heavy, so they load only the first time a Solar PDF
+// appears — VIKING/HAY users never download them.
+const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+const PDFJS_WORKER = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+const TESSERACT_URL = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+let ocrLibsReady = false;
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = src; s.onload = resolve; s.onerror = () => reject(new Error("load failed: " + src));
+    document.head.appendChild(s);
+  });
+}
+
+async function ensureOcrLibs() {
+  if (ocrLibsReady) return;
+  setStatus('<span class="spin"></span>Loading OCR engine (first Solar file only)…');
+  if (!window.pdfjsLib) await loadScript(PDFJS_URL);
+  if (!window.Tesseract) await loadScript(TESSERACT_URL);
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
+  ocrLibsReady = true;
+}
+
+async function ocrSolarFile(file, onProgress) {
+  await ensureOcrLibs();
+  const data = new Uint8Array(await file.arrayBuffer());
+  const pdf = await window.pdfjsLib.getDocument({ data }).promise;
+  // Danish language data, so Æ/Ø/Å come through correctly.
+  const worker = await window.Tesseract.createWorker("dan");
+  let text = "";
+  try {
+    for (let p = 1; p <= pdf.numPages; p++) {
+      if (onProgress) onProgress(p, pdf.numPages);
+      const page = await pdf.getPage(p);
+      const viewport = page.getViewport({ scale: 2.5 });   // ~225 dpi, good for OCR
+      const canvas = document.createElement("canvas");
+      canvas.width = viewport.width; canvas.height = viewport.height;
+      await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+      const { data: { text: pageText } } = await worker.recognize(canvas);
+      text += pageText + "\n";
+    }
+  } finally {
+    await worker.terminate();
+  }
+  return text;
+}
+
 // ---- 3. Convert ----------------------------------------------------------
 goBtn.addEventListener("click", async () => {
   goBtn.disabled = true;
@@ -161,28 +281,55 @@ goBtn.addEventListener("click", async () => {
   const includeConfig = $("cfgblock").checked;
   const addressMode = $("addrmode").value;
 
+  let okCount = 0, skipCount = 0;
   for (let i = 0; i < chosenFiles.length; i++) {
     const file = chosenFiles[i];
-    setStatus(`<span class="spin"></span>Converting ${i + 1} of ${chosenFiles.length}: ${esc(file.name)}`);
+    setStatus(`<span class="spin"></span>Scanning ${i + 1} of ${chosenFiles.length}: ${esc(file.name)}`);
+    let res;
     try {
       const buf = new Uint8Array(await file.arrayBuffer());
       const safe = "in_" + i + ".pdf";
       pyodide.FS.writeFile(safe, buf);
-      const outName = pyodide.runPython(
-        `_convert(${JSON.stringify(safe)}, ${includeConfig ? "True" : "False"}, ${JSON.stringify(addressMode)})`
-      );
-      const out = pyodide.FS.readFile(outName);            // Uint8Array
+      const company = pyodide.runPython(`_detect(${JSON.stringify(safe)})`);
+
+      if (company === "solar") {
+        // Solar's text layer is unusable -> OCR the pages in the browser.
+        const text = await ocrSolarFile(file, (p, n) =>
+          setStatus(`<span class="spin"></span>Reading ${esc(file.name)} with OCR — page ${p} of ${n}…`));
+        pyodide.FS.writeFile("ocr_in.txt", text);
+        const raw = pyodide.runPython(
+          `_convert_solar("ocr_in.txt", ${includeConfig ? "True" : "False"}, ${JSON.stringify(addressMode)})`
+        );
+        res = JSON.parse(raw);
+      } else {
+        const raw = pyodide.runPython(
+          `_convert(${JSON.stringify(safe)}, ${includeConfig ? "True" : "False"}, ${JSON.stringify(addressMode)})`
+        );
+        res = JSON.parse(raw);
+      }
+    } catch (e) {
+      res = { status: "error", reason: String(e) };
+    }
+
+    if (res.status === "ok" || res.status === "review") {
+      const out = pyodide.FS.readFile(res.out);              // Uint8Array
       const blob = new Blob([out],
         { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
       const url = URL.createObjectURL(blob);
       const niceName = uniqueName(file.name.replace(/\.pdf$/i, "") + ".xlsx");
       converted.push({ name: niceName, bytes: out });
-      addResult(file.name, url, niceName, true);
-    } catch (e) {
-      addResult(file.name, null, String(e), false);
+      addResult(file.name, { kind: res.status, company: res.company, url, niceName,
+                             note: res.note, reason: res.reason, detail: res.detail });
+      okCount++;
+    } else if (res.status === "skipped") {
+      addResult(file.name, { kind: "skipped", company: res.company, reason: res.reason });
+      skipCount++;
+    } else {
+      addResult(file.name, { kind: "error", reason: res.reason });
+      skipCount++;
     }
   }
-  setStatus(`Done. ${converted.length} of ${chosenFiles.length} converted.`);
+  setStatus(`Done. ${okCount} converted, ${skipCount} skipped.`);
   $("zipAll").hidden = converted.length < 2;   // only worth zipping 2+
   goBtn.disabled = false;
 });
@@ -217,23 +364,46 @@ $("zipAll").addEventListener("click", async () => {
   $("zipAll").disabled = false;
 });
 
-function addResult(pdfName, url, info, ok) {
+function addResult(pdfName, r) {
   const li = document.createElement("li");
+  const downloadable = (r.kind === "ok" || r.kind === "review");
+  if (!downloadable) li.classList.add("skip");
+  if (r.kind === "review") li.classList.add("review");
+
   const left = document.createElement("span");
+  left.className = "left";
   const mark = document.createElement("span");
-  mark.className = ok ? "ok" : "err";
-  mark.textContent = ok ? "✓ " : "✗ ";
+  const cls = { ok: "ok", review: "warn", skipped: "warn", error: "err" }[r.kind] || "err";
+  const sym = { ok: "✓ ", review: "! ", skipped: "– ", error: "✗ " }[r.kind] || "✗ ";
+  mark.className = cls; mark.textContent = sym;
   left.appendChild(mark);
-  left.appendChild(document.createTextNode(pdfName));   // filename as text, never HTML
+
+  if (r.company) {                       // small company badge
+    const badge = document.createElement("span");
+    badge.className = "badge";
+    badge.textContent = r.company;
+    left.appendChild(badge);
+  }
+  left.appendChild(document.createTextNode(" " + pdfName));   // text, never HTML
+
+  const msg = r.reason || r.note;        // reason (warnings) or note (OCR ok)
+  if (msg) {
+    const why = document.createElement("div");
+    why.className = "why"; why.textContent = msg;
+    left.appendChild(why);
+  }
+  if (r.detail) {
+    const d = document.createElement("div");
+    d.className = "detail"; d.textContent = r.detail;
+    left.appendChild(d);
+  }
   li.appendChild(left);
-  if (ok) {
+
+  if (downloadable) {
     const a = document.createElement("a");
-    a.href = url; a.download = info; a.textContent = "Download " + info;
+    a.href = r.url; a.download = r.niceName;
+    a.textContent = "Download " + r.niceName;
     li.appendChild(a);
-  } else {
-    const s = document.createElement("span");
-    s.className = "err"; s.textContent = info;
-    li.appendChild(s);
   }
   $("results").appendChild(li);
 }
